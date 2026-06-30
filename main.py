@@ -43,6 +43,10 @@ ACCOUNT_FILE = "breakcube_account.json"
 SETTINGS_FILE = "breakcube_settings.json"
 SERVER_HOST = "when-jury.gl.at.ply.gg"
 SERVER_PORT = 33699
+
+# Local fallback. If server.py is running on the same PC, this fixes endless loading.
+LOCAL_SERVER_HOST = "127.0.0.1"
+LOCAL_SERVER_PORT = 8484
 SONG_CACHE_DIR = Path(__file__).resolve().parent / "songs"
 SONG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -647,15 +651,15 @@ def draw_loading_overlay(text="LOADING..."):
         pygame.display.flip()
         yield
 
-def udp_request_raw(packet, timeout=5.0, retries=8):
-    """Reliable-ish UDP request for small JSON API packets.
+def udp_request_raw(packet, timeout=2.5, retries=3):
+    """UDP JSON request with fallback.
 
-    Старый код создавал НОВЫЙ UDP-сокет на каждую попытку.
-    Из-за этого ответ сервера иногда приходил на уже закрытый локальный порт,
-    и клиент видел вечный UDP TIMED OUT даже при рабочем сервере.
+    1) Tries SERVER_HOST/SERVER_PORT, usually playit.
+    2) If that does not answer, tries 127.0.0.1:8484.
+    This is important when the server is running locally, but the client still has playit host.
     """
-    timeout = max(float(timeout), 5.0)
-    retries = max(int(retries), 8)
+    timeout = max(0.7, float(timeout))
+    retries = max(1, int(retries))
 
     packet = dict(packet or {})
     packet.setdefault("request_id", "%08x%08x" % (
@@ -666,68 +670,66 @@ def udp_request_raw(packet, timeout=5.0, retries=8):
     raw = json.dumps(packet, ensure_ascii=False).encode("utf-8")
     last_error = "udp timeout"
 
-    sock = None
+    targets = [(SERVER_HOST, SERVER_PORT)]
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
+        local_target = (LOCAL_SERVER_HOST, LOCAL_SERVER_PORT)
+        if local_target not in targets:
+            targets.append(local_target)
+    except NameError:
+        pass
 
-        # connect() для UDP не делает TCP-соединение, но фиксирует адрес сервера
-        # и обычно стабильнее работает с NAT/playit: один локальный порт на весь запрос.
-        sock.connect((SERVER_HOST, SERVER_PORT))
-
-        for attempt in range(retries):
-            try:
-                sock.send(raw)
-
-                # Внутри одной попытки ждём до timeout секунд.
-                # Если прилетел мусор/старый пакет — не падаем, а ждём дальше.
-                deadline = time.time() + timeout
-                while time.time() < deadline:
-                    try:
-                        data = sock.recv(65535)
-                    except socket.timeout:
-                        last_error = "udp timeout"
-                        break
-
-                    try:
-                        response = json.loads(data.decode("utf-8"))
-                    except Exception as e:
-                        last_error = "bad udp json: " + str(e)
-                        continue
-
-                    # Если сервер умеет возвращать request_id — проверяем.
-                    # Если не умеет — всё равно принимаем ответ для совместимости.
-                    if response.get("request_id") and response.get("request_id") != packet.get("request_id"):
-                        last_error = "old udp response"
-                        continue
-
-                    return response
-
-            except socket.timeout:
-                last_error = "udp timeout"
-            except OSError as e:
-                last_error = "udp os error: " + str(e)
-                # На OSError нет смысла бешено спамить без маленькой паузы.
-                time.sleep(0.15)
-            except Exception as e:
-                last_error = "udp error: " + str(e)
-                time.sleep(0.15)
-
-            # Маленькая пауза между повторами, чтобы не душить tunnel/server.
-            time.sleep(0.12 + attempt * 0.03)
-
-    finally:
+    for host, port in targets:
+        sock = None
         try:
-            if sock:
-                sock.close()
-        except Exception:
-            pass
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+
+            for attempt in range(retries):
+                try:
+                    sock.sendto(raw, (host, port))
+
+                    deadline = time.time() + timeout
+                    while time.time() < deadline:
+                        try:
+                            data, _ = sock.recvfrom(65535)
+                        except socket.timeout:
+                            last_error = f"udp timeout {host}:{port}"
+                            break
+
+                        try:
+                            response = json.loads(data.decode("utf-8"))
+                        except Exception as e:
+                            last_error = "bad udp json: " + str(e)
+                            continue
+
+                        if response.get("request_id") and response.get("request_id") != packet.get("request_id"):
+                            last_error = "old udp response"
+                            continue
+
+                        if not response.get("ok"):
+                            print("SERVER ANSWER ERROR:", packet.get("path"), response.get("error"))
+                        return response
+
+                except OSError as e:
+                    last_error = f"udp os error {host}:{port}: {e}"
+                    time.sleep(0.08)
+                except Exception as e:
+                    last_error = f"udp error {host}:{port}: {e}"
+                    time.sleep(0.08)
+
+                time.sleep(0.08 + attempt * 0.03)
+
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
 
     print("UDP REQUEST FAILED:", packet.get("method"), packet.get("path"), last_error)
     return {"ok": False, "error": last_error}
 
-
-def udp_request(packet, timeout=5.0, retries=8, loading_text="LOADING..."):
+def udp_request(packet, timeout=2.5, retries=3, loading_text="LOADING..."):
     result_box = {"done": False, "result": None}
 
     def worker():
@@ -738,20 +740,25 @@ def udp_request(packet, timeout=5.0, retries=8, loading_text="LOADING..."):
     thread.start()
     loader = draw_loading_overlay(loading_text)
 
+    started = time.time()
+    max_wait = max(4.0, float(timeout) * max(1, int(retries)) * 2 + 1.0)
+
     while not result_box["done"]:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 raise SystemExit
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                # Не убиваем поток насильно, просто выходим с понятной ошибкой.
                 return {"ok": False, "error": "cancelled"}
+
+        if time.time() - started > max_wait:
+            return {"ok": False, "error": "client wait timeout"}
+
         next(loader)
 
     return result_box["result"] or {"ok": False, "error": "no response"}
 
-
-def api_get(path, params=None, timeout=5.0):
+def api_get(path, params=None, timeout=2.5):
     label = "LOADING..."
     if path == "/api/songs":
         label = "LOADING MUSIC..."
@@ -760,20 +767,21 @@ def api_get(path, params=None, timeout=5.0):
     elif path in ("/api/levels", "/api/level"):
         label = "LOADING LEVELS..."
 
+    # Lists should fail fast instead of looking like infinite loading.
+    retries = 2 if path in ("/api/levels", "/api/level") else 3
+
     return udp_request({
         "method": "GET",
         "path": path,
         "params": params or {}
-    }, timeout=max(float(timeout), 5.0), retries=8, loading_text=label)
+    }, timeout=max(float(timeout), 1.5), retries=retries, loading_text=label)
 
-
-def api_post(path, data, timeout=5.0):
+def api_post(path, data, timeout=2.5):
     return udp_request({
         "method": "POST",
         "path": path,
         "data": data or {}
-    }, timeout=max(float(timeout), 5.0), retries=8, loading_text="SAVING...")
-
+    }, timeout=max(float(timeout), 2.0), retries=3, loading_text="SAVING...")
 
 def get_account_name():
     acc = load_account()
@@ -1272,7 +1280,7 @@ def online_levels_list_screen(account, mode="popular"):
     def load_page(p):
         res = api_get("/api/levels", {"page": p, "per_page": 5, "order": "popular"}, timeout=2)
         if not res.get("ok"):
-            return [], 1, "SERVER ERROR"
+            return [], 1, ("SERVER ERROR: " + str(res.get("error", "unknown"))[:60])
         arr = res.get("levels", [])
         arr = sorted(arr, key=lambda x: int(x.get("likes", 0)) - int(x.get("dislikes", 0)), reverse=True)
         return arr, max(1, int(res.get("pages", 1))), ""
@@ -1337,7 +1345,7 @@ def my_levels_screen(account):
     def load_page(p):
         res = api_get("/api/levels", {"author": account, "page": p, "per_page": 5}, timeout=2)
         if not res.get("ok"):
-            return [], 1, "SERVER ERROR"
+            return [], 1, ("SERVER ERROR: " + str(res.get("error", "unknown"))[:60])
         return res.get("levels", []), max(1, int(res.get("pages", 1))), ""
 
     items, pages, message = load_page(page)
