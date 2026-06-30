@@ -647,28 +647,87 @@ def draw_loading_overlay(text="LOADING..."):
         pygame.display.flip()
         yield
 
-def udp_request_raw(packet, timeout=2.0, retries=3):
+def udp_request_raw(packet, timeout=5.0, retries=8):
+    """Reliable-ish UDP request for small JSON API packets.
+
+    Старый код создавал НОВЫЙ UDP-сокет на каждую попытку.
+    Из-за этого ответ сервера иногда приходил на уже закрытый локальный порт,
+    и клиент видел вечный UDP TIMED OUT даже при рабочем сервере.
+    """
+    timeout = max(float(timeout), 5.0)
+    retries = max(int(retries), 8)
+
+    packet = dict(packet or {})
+    packet.setdefault("request_id", "%08x%08x" % (
+        random.randint(0, 0xFFFFFFFF),
+        random.randint(0, 0xFFFFFFFF)
+    ))
+
     raw = json.dumps(packet, ensure_ascii=False).encode("utf-8")
+    last_error = "udp timeout"
 
-    for _ in range(retries):
-        sock = None
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(timeout)
-            sock.sendto(raw, (SERVER_HOST, SERVER_PORT))
-            data, _ = sock.recvfrom(65535)
-            sock.close()
-            return json.loads(data.decode("utf-8"))
-        except Exception:
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+
+        # connect() для UDP не делает TCP-соединение, но фиксирует адрес сервера
+        # и обычно стабильнее работает с NAT/playit: один локальный порт на весь запрос.
+        sock.connect((SERVER_HOST, SERVER_PORT))
+
+        for attempt in range(retries):
             try:
-                if sock:
-                    sock.close()
-            except Exception:
-                pass
+                sock.send(raw)
 
-    return {"ok": False, "error": "udp timeout"}
+                # Внутри одной попытки ждём до timeout секунд.
+                # Если прилетел мусор/старый пакет — не падаем, а ждём дальше.
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        data = sock.recv(65535)
+                    except socket.timeout:
+                        last_error = "udp timeout"
+                        break
 
-def udp_request(packet, timeout=2.0, retries=3, loading_text="LOADING..."):
+                    try:
+                        response = json.loads(data.decode("utf-8"))
+                    except Exception as e:
+                        last_error = "bad udp json: " + str(e)
+                        continue
+
+                    # Если сервер умеет возвращать request_id — проверяем.
+                    # Если не умеет — всё равно принимаем ответ для совместимости.
+                    if response.get("request_id") and response.get("request_id") != packet.get("request_id"):
+                        last_error = "old udp response"
+                        continue
+
+                    return response
+
+            except socket.timeout:
+                last_error = "udp timeout"
+            except OSError as e:
+                last_error = "udp os error: " + str(e)
+                # На OSError нет смысла бешено спамить без маленькой паузы.
+                time.sleep(0.15)
+            except Exception as e:
+                last_error = "udp error: " + str(e)
+                time.sleep(0.15)
+
+            # Маленькая пауза между повторами, чтобы не душить tunnel/server.
+            time.sleep(0.12 + attempt * 0.03)
+
+    finally:
+        try:
+            if sock:
+                sock.close()
+        except Exception:
+            pass
+
+    print("UDP REQUEST FAILED:", packet.get("method"), packet.get("path"), last_error)
+    return {"ok": False, "error": last_error}
+
+
+def udp_request(packet, timeout=5.0, retries=8, loading_text="LOADING..."):
     result_box = {"done": False, "result": None}
 
     def worker():
@@ -684,11 +743,15 @@ def udp_request(packet, timeout=2.0, retries=3, loading_text="LOADING..."):
             if event.type == pygame.QUIT:
                 pygame.quit()
                 raise SystemExit
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                # Не убиваем поток насильно, просто выходим с понятной ошибкой.
+                return {"ok": False, "error": "cancelled"}
         next(loader)
 
     return result_box["result"] or {"ok": False, "error": "no response"}
 
-def api_get(path, params=None, timeout=2):
+
+def api_get(path, params=None, timeout=5.0):
     label = "LOADING..."
     if path == "/api/songs":
         label = "LOADING MUSIC..."
@@ -701,14 +764,15 @@ def api_get(path, params=None, timeout=2):
         "method": "GET",
         "path": path,
         "params": params or {}
-    }, timeout=timeout, loading_text=label)
+    }, timeout=max(float(timeout), 5.0), retries=8, loading_text=label)
 
-def api_post(path, data, timeout=2):
+
+def api_post(path, data, timeout=5.0):
     return udp_request({
         "method": "POST",
         "path": path,
         "data": data or {}
-    }, timeout=timeout, loading_text="SAVING...")
+    }, timeout=max(float(timeout), 5.0), retries=8, loading_text="SAVING...")
 
 
 def get_account_name():
@@ -916,27 +980,33 @@ def download_song(name):
         pass
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.25)
+    sock.settimeout(0.5)
 
     def send_json(packet):
         raw = json.dumps(packet, ensure_ascii=False).encode("utf-8")
         sock.sendto(raw, (SERVER_HOST, SERVER_PORT))
 
-    send_json({
+    start_packet = {
         "method": "GET",
         "path": "/api/song_stream_start",
         "params": {"name": safe, "session": session.decode("ascii")}
-    })
+    }
+    send_json(start_packet)
 
     info = None
     start_wait = time.time()
+    last_start_request = start_wait
 
-    while time.time() - start_wait < 4:
+    while time.time() - start_wait < 10:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 sock.close()
                 pygame.quit()
                 raise SystemExit
+
+        if time.time() - last_start_request > 1.0:
+            send_json(start_packet)
+            last_start_request = time.time()
 
         try:
             data, _ = sock.recvfrom(65535)
